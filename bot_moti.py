@@ -11,7 +11,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import motivations
 
-ADDING_HABIT, SETTING_FREQUENCY, CONFIRMING_COMPLETION = range(3)
+ADDING_HABIT, SETTING_FREQUENCY, CONFIRMING_COMPLETION, DELETING_HABIT = range(4)
 
 class HabitTrackerBot:
     def __init__(self, token):
@@ -22,8 +22,7 @@ class HabitTrackerBot:
 
         # Создаем планировщик
         self.scheduler = BackgroundScheduler()
-        self.scheduler.start()
-
+        
         # Добавляем задачу на отправку уведомлений
         self.scheduler.add_job(
             self.send_reminder_sync,
@@ -31,6 +30,16 @@ class HabitTrackerBot:
             id='habit_reminder',
             replace_existing=True
         )
+        
+        # Задача на обновление прогресса
+        self.scheduler.add_job(
+            self.update_progress_sync,
+            IntervalTrigger(hours=1),
+            id='progress_update',
+            replace_existing=True
+        )
+
+        self.scheduler.start()
 
         # Добавляем обработчики команд и состояний
         self.conv_handler = ConversationHandler(
@@ -41,13 +50,46 @@ class HabitTrackerBot:
             states={
                 ADDING_HABIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_habit)],
                 SETTING_FREQUENCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_frequency)],
-                CONFIRMING_COMPLETION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.complete_habit)]
+                CONFIRMING_COMPLETION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.complete_habit)],
+                DELETING_HABIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.delete_habit)]
             },
             fallbacks=[CommandHandler('start', self.start)]
         )
 
         self.app.add_handler(self.conv_handler)
-        self.app.add_handler(CallbackQueryHandler(self.button_handler))
+        
+        
+    def update_progress_sync(self):
+        self.app.create_task(self.update_progress())
+        
+    async def update_progress(self):
+        conn = sqlite3.connect('grim_hustle.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT id, habit_name, progress, total, frequency FROM habits WHERE archived = 0')
+        habits = cursor.fetchall()
+
+        for habit in habits:
+            habit_id, habit_name, progress, total, frequency = habit
+
+            # Расчет процента в зависимости от частоты
+            if frequency == 'Ежедневно':
+                increment = 100 / 30  # Прогресс 3.33% в день
+            elif frequency == 'Еженедельно':
+                increment = 100 / 4   # Прогресс 25% в неделю
+            elif frequency == 'Ежемесячно':
+                increment = 100       # Прогресс 100% в месяц
+            else:
+                continue  # если частота неизвестна, пропустить
+
+            # Обновление прогресса и проверка выполнения
+            new_progress = progress + (increment * total / 100)
+            if new_progress >= total:
+                cursor.execute('UPDATE habits SET progress = ?, archived = 1 WHERE id = ?', (total, habit_id))
+            else:
+                cursor.execute('UPDATE habits SET progress = ? WHERE id = ?', (new_progress, habit_id))
+
+        conn.commit()
+        conn.close()
 
     def _init_db(self):
         conn = sqlite3.connect('grim_hustle.db')
@@ -99,7 +141,7 @@ class HabitTrackerBot:
             [InlineKeyboardButton("Добавить привычку", callback_data='add_habit')],
             [InlineKeyboardButton("Показать прогресс", callback_data='progress')],
             [InlineKeyboardButton("Получить мотивацию", callback_data='motivation')],
-            [InlineKeyboardButton("Удалить привычку", callback_data='complete_habit')]
+            [InlineKeyboardButton("Удалить привычку", callback_data='delete_habit')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.callback_query.message.edit_text(
@@ -107,7 +149,7 @@ class HabitTrackerBot:
             "🌱 Добавить привычку: Напиши свою новую цель, выбери, как часто будешь её выполнять, и мы начнём путь!\n\n"
             "🚀 Показать прогресс: Загляни в свои достижения и посмотри, как продвигаешься. Каждый шаг — это маленькая победа!\n\n"
             "💪 Получить мотивацию: Иногда нужно немного силы и вдохновения. Получи фразу, которая поднимет боевой дух!\n\n"
-            "🎯 Завершить привычку: Как только ты освоил привычку — можно удалить её.\n\n"
+            "🎯 Удалить привычку: Как только ты освоил привычку — можно удалить её.\n\n"
             "Выбирай цель, ставь план и побеждай себя каждый день! 🌟",
             reply_markup=reply_markup
         )
@@ -129,8 +171,11 @@ class HabitTrackerBot:
             await self.send_motivation(update, context)
             return ConversationHandler.END
         elif query.data == 'complete_habit':
-            await query.edit_message_text("Введите название привычки, которую хотите удалить:")
+            await query.edit_message_text("Введите название привычки, для увеличения её прогресса:")
             return CONFIRMING_COMPLETION
+        elif query.data == 'delete_habit':
+            await query.edit_message_text("Введите название привычки, которую хотите удалить:")
+            return DELETING_HABIT
 
     async def add_habit(self, update: Update, context: CallbackContext):
         habit_name = update.message.text
@@ -162,27 +207,71 @@ class HabitTrackerBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text("Вы можете вернуться в главное меню и продолжить отслеживание!", reply_markup=reply_markup)
         return ConversationHandler.END
-
+    
     async def complete_habit(self, update: Update, context: CallbackContext):
+         # Получаем название привычки, чтобы увеличить прогресс
         habit_name = update.message.text
         user_id = update.message.from_user.id
 
+        # Подключаемся к базе данных
         conn = sqlite3.connect('grim_hustle.db')
         cursor = conn.cursor()
-        cursor.execute('UPDATE habits SET archived = 1 WHERE user_id = ? AND habit_name = ?', (user_id, habit_name))
-        affected_rows = cursor.rowcount
+
+        # Проверяем, есть ли такая привычка у пользователя
+        cursor.execute('SELECT id, progress, total FROM habits WHERE user_id = ? AND habit_name = ? AND archived = 0', 
+                   (user_id, habit_name))
+        habit = cursor.fetchone()
+
+        if habit:
+            habit_id, progress, total = habit
+            new_progress = progress + 10  # Увеличиваем прогресс на 10 (это можно настроить)
+
+            # Если прогресс достиг или превысил цель, архивируем привычку
+            if new_progress >= total:
+                cursor.execute('UPDATE habits SET progress = ?, archived = 1 WHERE id = ?', (total, habit_id))
+                message = f"Поздравляем! Вы завершили привычку '{habit_name}' и она теперь будет перемещена в архив."
+            else:
+                cursor.execute('UPDATE habits SET progress = ? WHERE id = ?', (new_progress, habit_id))
+                message = f"Прогресс для привычки '{habit_name}' увеличен на 10. Теперь ваш прогресс: {new_progress}/{total}."
+
+            conn.commit()
+        else:
+            message = "Привычка не найдена или уже завершена."
+
+        conn.close()
+
+        # Отправляем сообщение пользователю
+        await update.message.reply_text(message)
+
+        # Возвращаем пользователя в главное меню
+        keyboard = [[InlineKeyboardButton("Вернуться в меню", callback_data='main_menu')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Вы можете вернуться в главное меню.", reply_markup=reply_markup)
+    
+        return ConversationHandler.END
+    
+    async def delete_habit(self, update: Update, context: CallbackContext):
+        # Получаем название привычки, которую нужно удалить, от пользователя
+        habit_name = update.message.text
+        user_id = update.message.from_user.id
+
+        # Удаляем привычку из базы данных
+        conn = sqlite3.connect('grim_hustle.db')
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM habits WHERE user_id = ? AND habit_name = ?', (user_id, habit_name))
         conn.commit()
         conn.close()
 
-        if affected_rows > 0:
-            message = f"Привычка '{habit_name}' успешно удалена!"
-        else:
-            message = f"Привычка '{habit_name}' не найдена."
-
+        # Сообщаем пользователю, что привычка успешно удалена
+        await update.message.reply_text(f"Привычка '{habit_name}' успешно удалена.")
+        
+        # Предлагаем пользователю вернуться в меню
         keyboard = [[InlineKeyboardButton("Вернуться в меню", callback_data='main_menu')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(message, reply_markup=reply_markup)
+        await update.message.reply_text("Вы можете вернуться в главное меню и продолжить отслеживание!", reply_markup=reply_markup)
+        
         return ConversationHandler.END
+
 
     async def check_progress(self, update: Update, context: CallbackContext):
         query = update.callback_query
@@ -224,15 +313,18 @@ class HabitTrackerBot:
 
         for user_id, habit_name, frequency in habits:
             message = f"Не забывай про свою привычку '{habit_name}'! Продолжай работать над собой!"
-            await self.app.bot.send_message(user_id, message)
+            try:
+                await self.app.bot.send_message(user_id, message)
+            except Exception as e:
+                print(f"Ошибка при отправке напоминания: {e}")
 
     def send_reminder_sync(self):
-        asyncio.run(self.send_reminder())
+        self.app.create_task(self.send_reminder())
 
     def run(self):
+        print("Бот запущен!")
         self.app.run_polling()
 
-# Запуск бота
 if __name__ == "__main__":
     bot = HabitTrackerBot('7553618991:AAF9_O2JYaLbwbFRuMmXURk5wfJv9McViPY')
     bot.run()
