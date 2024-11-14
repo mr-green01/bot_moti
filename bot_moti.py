@@ -326,6 +326,6 @@ class HabitTrackerBot:
         self.app.run_polling()
 
 if __name__ == "__main__":
-    bot = HabitTrackerBot('7553618991:AAF9_O2JYaLbwbFRuMmXURk5wfJv9McViPY')
+    bot = HabitTrackerBot('ВАШ_ТОКЕН')
     bot.run()
 
