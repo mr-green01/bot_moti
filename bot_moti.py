@@ -1,3 +1,4 @@
+import aiosqlite
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -5,11 +6,12 @@ from telegram.ext import (
     CallbackQueryHandler, filters
 )
 import sqlite3
-import random
 from datetime import datetime
+import random
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.interval import IntervalTrigger
 import motivations
+from scheduler_tasks import SchedulerTasks
+import logging
 
 ADDING_HABIT, SETTING_FREQUENCY, CONFIRMING_COMPLETION, DELETING_HABIT = range(4)
 
@@ -19,27 +21,12 @@ class HabitTrackerBot:
         self.app = Application.builder().token(self.token).build()
         self._init_db()
         self._add_archived_column()
-
-        # Создаем планировщик
-        self.scheduler = BackgroundScheduler()
+        self._add_blocked_column()
         
-        # Добавляем задачу на отправку уведомлений
-        self.scheduler.add_job(
-            self.send_reminder_sync,
-            IntervalTrigger(hours=24),
-            id='habit_reminder',
-            replace_existing=True
-        )
-        
-        # Задача на обновление прогресса
-        self.scheduler.add_job(
-            self.update_progress_sync,
-            IntervalTrigger(hours=1),
-            id='progress_update',
-            replace_existing=True
-        )
+        # Инициализируем планировщик
+        self.scheduler_tasks = SchedulerTasks(self.app.bot)
+        self.scheduler_tasks.start()
 
-        self.scheduler.start()
 
         # Добавляем обработчики команд и состояний
         self.conv_handler = ConversationHandler(
@@ -58,39 +45,13 @@ class HabitTrackerBot:
 
         self.app.add_handler(self.conv_handler)
         
+                
         
     def update_progress_sync(self):
-        self.app.create_task(self.update_progress())
+        asyncio.run(self.update_progress())
+
+
         
-    async def update_progress(self):
-        conn = sqlite3.connect('grim_hustle.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT id, habit_name, progress, total, frequency FROM habits WHERE archived = 0')
-        habits = cursor.fetchall()
-
-        for habit in habits:
-            habit_id, habit_name, progress, total, frequency = habit
-
-            # Расчет процента в зависимости от частоты
-            if frequency == 'Ежедневно':
-                increment = 100 / 30  # Прогресс 3.33% в день
-            elif frequency == 'Еженедельно':
-                increment = 100 / 4   # Прогресс 25% в неделю
-            elif frequency == 'Ежемесячно':
-                increment = 100       # Прогресс 100% в месяц
-            else:
-                continue  # если частота неизвестна, пропустить
-
-            # Обновление прогресса и проверка выполнения
-            new_progress = progress + (increment * total / 100)
-            if new_progress >= total:
-                cursor.execute('UPDATE habits SET progress = ?, archived = 1 WHERE id = ?', (total, habit_id))
-            else:
-                cursor.execute('UPDATE habits SET progress = ? WHERE id = ?', (new_progress, habit_id))
-
-        conn.commit()
-        conn.close()
-
     def _init_db(self):
         conn = sqlite3.connect('grim_hustle.db')
         cursor = conn.cursor()
@@ -108,6 +69,7 @@ class HabitTrackerBot:
         ''')
         conn.commit()
         conn.close()
+        pass
         
     def _add_archived_column(self):
         conn = sqlite3.connect('grim_hustle.db')
@@ -116,6 +78,17 @@ class HabitTrackerBot:
             cursor.execute('ALTER TABLE habits ADD COLUMN archived INTEGER DEFAULT 0')
         except sqlite3.OperationalError:
             pass
+        conn.commit()
+        conn.close()
+        pass
+    
+    def _add_blocked_column(self):
+        conn = sqlite3.connect('grim_hustle.db')
+        cursor = conn.cursor()
+        try:
+            cursor.execute('ALTER TABLE habits ADD COLUMN is_blocked INTEGER DEFAULT 0')
+        except sqlite3.OperationalError:
+            pass  # Если колонка уже существует, просто пропускаем
         conn.commit()
         conn.close()
 
@@ -303,29 +276,25 @@ class HabitTrackerBot:
         keyboard = [[InlineKeyboardButton("Вернуться в меню", callback_data='main_menu')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(f"💪 {quote}", reply_markup=reply_markup)
+        
+    def should_send_reminder(self, frequency):
+        now = datetime.now()
+        
+        if frequency == 'Ежедневно':
+            return True  # Ежедневные привычки всегда получают напоминания
+        elif frequency == 'Еженедельно':
+            return now.weekday() == 0  # Например, отправляем по понедельникам
+        elif frequency == 'Ежемесячно':
+            return now.day == 1  # Отправляем напоминание в первый день месяца
+        return True  # Для неизвестной частоты напоминания не отправляются
 
-    async def send_reminder(self):
-        conn = sqlite3.connect('grim_hustle.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id, habit_name, frequency FROM habits WHERE archived = 0')
-        habits = cursor.fetchall()
-        conn.close()
 
-        for user_id, habit_name, frequency in habits:
-            message = f"Не забывай про свою привычку '{habit_name}'! Продолжай работать над собой!"
-            try:
-                await self.app.bot.send_message(user_id, message)
-            except Exception as e:
-                print(f"Ошибка при отправке напоминания: {e}")
-
-    def send_reminder_sync(self):
-        self.app.create_task(self.send_reminder())
-
+    
     def run(self):
         print("Бот запущен!")
         self.app.run_polling()
 
 if __name__ == "__main__":
-    bot = HabitTrackerBot('ВАШ_ТОКЕН')
+    bot = HabitTrackerBot('7553618991:AAF9_O2JYaLbwbFRuMmXURk5wfJv9McViPY')
     bot.run()
 
